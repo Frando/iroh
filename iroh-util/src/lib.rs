@@ -148,7 +148,11 @@ where
     }
 
     // next, add any environment variables
-    builder = builder.add_source(Environment::with_prefix(env_prefix).try_parsing(true));
+    builder = builder.add_source(
+        Environment::with_prefix(env_prefix)
+            .separator("__")
+            .try_parsing(true),
+    );
 
     // pull metrics config from env variables
     // nesting into this odd `MetricsSource` struct, gives us the option of

@@ -42,12 +42,13 @@ async fn main() -> Result<()> {
     let rpc_addr = config
         .server_rpc_addr()?
         .ok_or_else(|| anyhow!("missing gateway rpc addr"))?;
-    let content_loader = RpcClient::new(config.rpc_client.clone()).await?;
+    let rpc_client = RpcClient::new(config.rpc_client.clone()).await?;
     let handler = Core::new(
         Arc::new(config),
         rpc_addr,
         Arc::clone(&bad_bits),
-        content_loader,
+        rpc_client.clone(),
+        rpc_client,
     )
     .await?;
 

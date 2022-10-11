@@ -1,5 +1,5 @@
 use axum::Router;
-use iroh_resolver::resolver::ContentLoader;
+use iroh_resolver::{resolver::ContentLoader, writer::ContentWriter};
 use iroh_rpc_types::gateway::GatewayServerAddr;
 
 use std::{collections::HashMap, sync::Arc};
@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     bad_bits::BadBits,
-    client::Client,
+    client::{Client, WritingClient},
     handlers::{get_app_routes, StateConfig},
     rpc,
     rpc::Gateway,
@@ -15,8 +15,9 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub struct Core<T: ContentLoader> {
+pub struct Core<T: ContentLoader, U: ContentWriter> {
     state: Arc<State<T>>,
+    writer: Arc<WritingClient<U>>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,12 +28,13 @@ pub struct State<T: ContentLoader> {
     pub bad_bits: Arc<Option<RwLock<BadBits>>>,
 }
 
-impl<T: ContentLoader + std::marker::Unpin> Core<T> {
+impl<T: ContentLoader + std::marker::Unpin, U: ContentWriter + std::marker::Unpin> Core<T, U> {
     pub async fn new(
         config: Arc<dyn StateConfig>,
         rpc_addr: GatewayServerAddr,
         bad_bits: Arc<Option<RwLock<BadBits>>>,
         content_loader: T,
+        content_writer: U,
     ) -> anyhow::Result<Self> {
         tokio::spawn(async move {
             if let Err(err) = rpc::new(rpc_addr, Gateway::default()).await {
@@ -43,6 +45,7 @@ impl<T: ContentLoader + std::marker::Unpin> Core<T> {
         templates.insert("dir_list".to_string(), templates::DIR_LIST.to_string());
         templates.insert("not_found".to_string(), templates::NOT_FOUND.to_string());
         let client = Client::<T>::new(&content_loader);
+        let writer = WritingClient::new(content_writer);
 
         Ok(Self {
             state: Arc::new(State {
@@ -51,43 +54,49 @@ impl<T: ContentLoader + std::marker::Unpin> Core<T> {
                 handlebars: templates,
                 bad_bits,
             }),
+            writer: Arc::new(writer),
         })
     }
 
     pub async fn new_with_state(
         rpc_addr: GatewayServerAddr,
         state: Arc<State<T>>,
+        writer: Arc<WritingClient<U>>,
     ) -> anyhow::Result<Self> {
         tokio::spawn(async move {
             if let Err(err) = rpc::new(rpc_addr, Gateway::default()).await {
                 tracing::error!("Failed to run gateway rpc handler: {}", err);
             }
         });
-        Ok(Self { state })
+        Ok(Self { state, writer })
     }
 
     pub async fn make_state(
         config: Arc<dyn StateConfig>,
         bad_bits: Arc<Option<RwLock<BadBits>>>,
         content_loader: T,
-    ) -> anyhow::Result<Arc<State<T>>> {
+        content_writer: U,
+    ) -> anyhow::Result<(Arc<State<T>>, Arc<WritingClient<U>>)> {
         let mut templates = HashMap::new();
         templates.insert("dir_list".to_string(), templates::DIR_LIST.to_string());
         templates.insert("not_found".to_string(), templates::NOT_FOUND.to_string());
         let client = Client::new(&content_loader);
-        Ok(Arc::new(State {
-            config,
-            client,
-            handlebars: templates,
-            bad_bits,
-        }))
+        Ok((
+            Arc::new(State {
+                config,
+                client,
+                handlebars: templates,
+                bad_bits,
+            }),
+            Arc::new(WritingClient::new(content_writer)),
+        ))
     }
 
     pub fn server(
         self,
     ) -> axum::Server<hyper::server::conn::AddrIncoming, axum::routing::IntoMakeService<Router>>
     {
-        let app = get_app_routes(&self.state);
+        let app = get_app_routes(&self.state, &self.writer);
 
         // todo(arqu): make configurable
         let addr = format!("0.0.0.0:{}", self.state.config.port());
@@ -123,9 +132,15 @@ mod tests {
     ) -> (SocketAddr, RpcClient, tokio::task::JoinHandle<()>) {
         let rpc_addr = "grpc://0.0.0.0:0".parse().unwrap();
         let rpc_client = RpcClient::new(config.rpc_client().clone()).await.unwrap();
-        let core = Core::new(config, rpc_addr, Arc::new(None), rpc_client.clone())
-            .await
-            .unwrap();
+        let core = Core::new(
+            config,
+            rpc_addr,
+            Arc::new(None),
+            rpc_client.clone(),
+            rpc_client.clone(),
+        )
+        .await
+        .unwrap();
         let server = core.server();
         let addr = server.local_addr();
         let core_task = tokio::spawn(async move {

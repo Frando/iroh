@@ -81,18 +81,18 @@ async fn main() -> Result<()> {
         false => Arc::new(None),
     };
 
+    let rpc_client = RpcClient::new(config.rpc_client.clone()).await?;
     // let content_loader = RpcClient::new(config.rpc_client.clone()).await?;
-    let content_loader = iroh_one::content_loader::RacingLoader::new(
-        RpcClient::new(config.rpc_client.clone()).await?,
-    );
-    let shared_state = Core::make_state(
+    let content_loader = iroh_one::content_loader::RacingLoader::new(rpc_client.clone());
+    let (shared_state, writer) = Core::make_state(
         Arc::new(config.clone()),
         Arc::clone(&bad_bits),
         content_loader,
+        rpc_client.clone(),
     )
     .await?;
 
-    let handler = Core::new_with_state(gateway_rpc_addr, Arc::clone(&shared_state)).await?;
+    let handler = Core::new_with_state(gateway_rpc_addr, Arc::clone(&shared_state), writer).await?;
 
     let metrics_handle = iroh_metrics::MetricsHandle::new(metrics_config)
         .await

@@ -2,6 +2,7 @@ use anyhow::Result;
 use axum::http::header::*;
 use config::{ConfigError, Map, Source, Value};
 
+use iroh_gateway::writeable::WriteableConfig;
 use iroh_metrics::config::Config as MetricsConfig;
 use iroh_p2p::Libp2pConfig;
 use iroh_rpc_client::Config as RpcClientConfig;
@@ -166,5 +167,9 @@ impl iroh_gateway::handlers::StateConfig for Config {
 
     fn user_headers(&self) -> &HeaderMap<HeaderValue> {
         &self.gateway.headers
+    }
+
+    fn writeable_config(&self) -> WriteableConfig {
+        self.gateway.writeable_config()
     }
 }

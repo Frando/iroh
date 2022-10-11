@@ -14,13 +14,14 @@ iroh-rpc-types = { path = "../iroh-rpc-types", default-features = false }
 cid = "0.8.6"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs"] }
-axum = "0.5.1"
+axum = { version = "0.5.1", features = ["headers"] }
 clap = { version = "4.0.9", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.78"
 serde_qs = "0.10.1"
 tower = { version = "0.4", features = ["util", "timeout", "load-shed", "limit"] }
 mime_guess = "2.0.4"
+mime = "0.3"
 iroh-metrics = { path = "../iroh-metrics", default-features = false, features = ["gateway"] }
 tracing = "0.1.33"
 names = { version = "0.14.0", default-features = false }
@@ -41,7 +42,7 @@ iroh-car = { path = "../iroh-car" }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1.1.0"
 tower-layer = { version = "0.3" }
-tower-http = { version = "0.3", features = ["trace", "compression-full"] }
+tower-http = { version = "0.3", features = ["trace", "compression-full", "cors"] }
 http = "0.2"
 async-recursion = "1.0.0"
 handlebars = "4"
@@ -57,6 +58,7 @@ reqwest = { version = "0.11.10", features = ["rustls-tls"], default-features = f
 hex-literal = "0.3.4"
 hex = "0.4.3"
 http-body = "0.4.5"
+jsonwebtoken = "8.1.1"
 
 [dev-dependencies]
 axum-macros = "0.2.0" # use #[axum_macros::debug_handler] for better error messages on handlers

@@ -1,8 +1,9 @@
-use std::pin::Pin;
 use std::task::Poll;
+use std::{collections::HashMap, pin::Pin};
 
 use anyhow::Result;
 use bytes::Bytes;
+use cid::Cid;
 use futures::{StreamExt, TryStream};
 use http::HeaderMap;
 use iroh_car::{CarHeader, CarWriter};
@@ -11,12 +12,16 @@ use iroh_metrics::{
     gateway::{GatewayHistograms, GatewayMetrics},
     observe, record,
 };
-use iroh_resolver::resolver::{
-    CidOrDomain, ContentLoader, Metadata, Out, OutMetrics, OutPrettyReader, Resolver, Source,
+use iroh_resolver::{
+    resolver::{
+        CidOrDomain, ContentLoader, Metadata, Out, OutMetrics, OutPrettyReader, Resolver, Source,
+    },
+    writer::ContentWriter,
 };
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio_util::io::ReaderStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::response::ResponseFormat;
 use crate::{constants::RECURSION_LIMIT, handlers::GetParams};
@@ -227,4 +232,49 @@ fn record_ttfb_metrics(start_time: std::time::Instant, source: &Source) {
             start_time.elapsed().as_millis() as f64
         );
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct WritingClient<T: ContentWriter> {
+    writer: T,
+}
+
+impl<T: ContentWriter + std::marker::Unpin> WritingClient<T> {
+    pub fn new(writer: T) -> Self {
+        Self { writer }
+    }
+
+    #[tracing::instrument(skip(self, bytes))]
+    pub async fn put_car(
+        &self,
+        bytes: impl AsyncRead + Send + Unpin + 'static,
+        start_time: std::time::Instant,
+    ) -> Result<WriteCarOutputSerializable> {
+        let out = self.writer.write_car(bytes).await?;
+        let count = out.blocks.len();
+        let bytes: usize = out.blocks.iter().map(|(_, len)| len).sum();
+        debug!(
+            "imported {} elements ({}) in {}s",
+            count,
+            bytes,
+            start_time.elapsed().as_secs()
+        );
+        let out = WriteCarOutputSerializable {
+            success: true,
+            roots: out.roots.iter().map(Cid::to_string).collect(),
+            blocks: out
+                .blocks
+                .into_iter()
+                .map(|(cid, len)| (cid.to_string(), len))
+                .collect(),
+        };
+        Ok(out)
+    }
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct WriteCarOutputSerializable {
+    blocks: HashMap<String, usize>,
+    roots: Vec<String>,
+    success: bool,
 }

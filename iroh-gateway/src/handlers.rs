@@ -2,10 +2,10 @@ use async_recursion::async_recursion;
 use axum::{
     body::{self, Body, HttpBody},
     error_handling::HandleErrorLayer,
-    extract::{Extension, Path, Query},
+    extract::{BodyStream, Extension, Path, Query},
     http::{header::*, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     BoxError, Router,
 };
 use bytes::Bytes;
@@ -15,6 +15,7 @@ use iroh_metrics::{core::MRecorder, gateway::GatewayMetrics, get_current_trace_i
 use iroh_resolver::{
     resolver::{CidOrDomain, ContentLoader, OutMetrics, UnixfsType},
     unixfs::Link,
+    writer::ContentWriter,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{
@@ -30,18 +31,20 @@ use std::{
     time::{self, Duration},
 };
 use tower::ServiceBuilder;
-use tower_http::{compression::CompressionLayer, trace::TraceLayer};
-use tracing::info_span;
+use tower_http::{compression::CompressionLayer, cors, trace::TraceLayer};
+use tracing::{debug, info_span};
 use url::Url;
 use urlencoding::encode;
 
 use crate::{
-    client::{FileResult, Request},
+    client::{FileResult, Request, WritingClient},
     constants::*,
     core::State,
     error::GatewayError,
     headers::*,
+    request::{get_request_format, RequestFormat},
     response::{get_response_format, GatewayResponse, ResponseFormat},
+    writeable::{WriteCapability, WriteableConfig},
 };
 
 /// Trait describing what needs to be accessed on the configuration
@@ -52,15 +55,42 @@ pub trait StateConfig: std::fmt::Debug + Sync + Send {
     fn port(&self) -> u16;
 
     fn user_headers(&self) -> &HeaderMap<HeaderValue>;
+
+    fn writeable_config(&self) -> WriteableConfig {
+        WriteableConfig::Disabled
+    }
 }
 
-pub fn get_app_routes<T: ContentLoader + std::marker::Unpin>(state: &Arc<State<T>>) -> Router {
+pub fn get_app_routes<
+    T: ContentLoader + std::marker::Unpin,
+    U: ContentWriter + std::marker::Unpin,
+>(
+    state: &Arc<State<T>>,
+    writer: &Arc<WritingClient<U>>,
+) -> Router {
     // todo(arqu): ?uri=... https://github.com/ipfs/go-ipfs/pull/7802
+    let writeable_config = state.config.writeable_config();
     Router::new()
         .route("/:scheme/:cid", get(get_handler::<T>))
         .route("/:scheme/:cid/*cpath", get(get_handler::<T>))
+        .route("/_experimental/write", post(write_handler::<T, U>))
         .route("/health", get(health_check))
         .layer(Extension(Arc::clone(state)))
+        .layer(Extension(Arc::clone(writer)))
+        .layer(Extension(writeable_config))
+        // TODO: Make cors origin configurable and remove the cors headers
+        // from the default user headers. The middleware handles OPTIONS
+        // requests which is needed for CORS to properly work in the browser.
+        .layer(
+            cors::CorsLayer::new()
+                .allow_origin(cors::Any)
+                .allow_methods([http::Method::GET, http::Method::POST])
+                .allow_headers([
+                    http::header::CONTENT_TYPE,
+                    http::header::ACCEPT,
+                    http::header::AUTHORIZATION,
+                ]),
+        )
         .layer(
             ServiceBuilder::new()
                 // Handle errors from middleware
@@ -176,6 +206,8 @@ pub async fn get_handler<T: ContentLoader + std::marker::Unpin>(
     let download = query_params.download.unwrap_or_default();
     let recursive = query_params.recursive.unwrap_or_default();
 
+    debug!("format: {format:?}, recursive: {recursive:?}");
+
     let mut headers = HeaderMap::new();
 
     if let Some(resp) = etag_check(&request_headers, resolved_cid, &format, &state) {
@@ -216,6 +248,41 @@ pub async fn get_handler<T: ContentLoader + std::marker::Unpin>(
             ResponseFormat::Car => serve_car(&req, state, headers, start_time).await,
             ResponseFormat::Fs(_) => serve_fs(&req, state, headers, start_time).await,
         }
+    }
+}
+
+#[tracing::instrument(skip(state))]
+pub async fn write_handler<T: ContentLoader, U: ContentWriter + std::marker::Unpin>(
+    _cap: WriteCapability,
+    Extension(state): Extension<Arc<State<T>>>,
+    Extension(writer): Extension<Arc<WritingClient<U>>>,
+    Path(params): Path<HashMap<String, String>>,
+    Query(query_params): Query<GetParams>,
+    body: BodyStream,
+    request_headers: HeaderMap,
+) -> Result<GatewayResponse, GatewayError> {
+    let start_time = time::Instant::now();
+    let mut headers = HeaderMap::new();
+    add_user_headers(&mut headers, state.config.user_headers().clone());
+    let format = match get_request_format(&request_headers, query_params.format) {
+        Ok(format) => format,
+        Err(err) => {
+            return Err(error(StatusCode::BAD_REQUEST, &err, &state));
+        }
+    };
+    debug!("write request, format {:?}", format);
+    let body_stream =
+        body.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()));
+    let body_reader = tokio_util::io::StreamReader::new(body_stream);
+    match format {
+        RequestFormat::Car => {
+            let out = writer
+                .put_car(body_reader, start_time)
+                .await
+                .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), &state))?;
+            response_json(StatusCode::OK, &out, headers)
+        }
+        _ => Err(error(StatusCode::BAD_REQUEST, "unsupported format", &state)),
     }
 }
 
@@ -571,6 +638,24 @@ where
         headers,
         trace_id: get_current_trace_id().to_string(),
     })
+}
+
+#[tracing::instrument(skip(data))]
+fn response_json<T: Serialize>(
+    status_code: StatusCode,
+    data: T,
+    mut headers: HeaderMap,
+) -> Result<GatewayResponse, GatewayError> {
+    let json = serde_json::to_string(&data).map_err(|err| GatewayError {
+        status_code: http::status::StatusCode::INTERNAL_SERVER_ERROR,
+        message: err.to_string(),
+        trace_id: get_current_trace_id().to_string(),
+    })?;
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static(mime::APPLICATION_JSON.as_ref()),
+    );
+    response(status_code, json, headers)
 }
 
 #[tracing::instrument()]
