@@ -34,7 +34,7 @@ use std::{
 };
 
 use tower::ServiceBuilder;
-use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+use tower_http::{compression::CompressionLayer, cors, trace::TraceLayer};
 use tracing::info_span;
 use url::Url;
 use urlencoding::encode;
@@ -49,6 +49,10 @@ use crate::{
     templates::{icon_class_name, ICONS_STYLESHEET, STYLESHEET},
 };
 
+use crate::writeable::{
+    client::WritingClient, handlers::add_write_route, writer::ContentWriter, WriteableConfig,
+};
+
 /// Trait describing what needs to be accessed on the configuration
 /// from the shared state.
 pub trait StateConfig: std::fmt::Debug + Sync + Send {
@@ -56,17 +60,42 @@ pub trait StateConfig: std::fmt::Debug + Sync + Send {
     fn public_url_base(&self) -> &str;
     fn port(&self) -> u16;
     fn user_headers(&self) -> &HeaderMap<HeaderValue>;
+
+    fn writeable_config(&self) -> WriteableConfig {
+        WriteableConfig::Disabled
+    }
 }
 
-pub fn get_app_routes<T: ContentLoader + std::marker::Unpin>(state: &Arc<State<T>>) -> Router {
+pub fn get_app_routes<
+    T: ContentLoader + std::marker::Unpin,
+    U: ContentWriter + std::marker::Unpin,
+>(
+    state: &Arc<State<T>>,
+    writer: &Arc<WritingClient<U>>,
+) -> Router {
     // todo(arqu): ?uri=... https://github.com/ipfs/go-ipfs/pull/7802
-    Router::new()
+    let router = Router::new()
         .route("/:scheme/:cid", get(get_handler::<T>))
         .route("/:scheme/:cid/*cpath", get(get_handler::<T>))
         .route("/health", get(health_check))
         .route("/icons.css", get(stylesheet_icons))
-        .route("/style.css", get(stylesheet_main))
+        .route("/style.css", get(stylesheet_main));
+    let router = add_write_route(router, state, writer);
+    router
         .layer(Extension(Arc::clone(state)))
+        // TODO: Make cors origin configurable and remove the cors headers
+        // from the default user headers. The middleware handles OPTIONS
+        // requests which is needed for CORS to properly work in the browser.
+        .layer(
+            cors::CorsLayer::new()
+                .allow_origin(cors::Any)
+                .allow_methods([http::Method::GET, http::Method::POST])
+                .allow_headers([
+                    http::header::CONTENT_TYPE,
+                    http::header::ACCEPT,
+                    http::header::AUTHORIZATION,
+                ]),
+        )
         .layer(
             ServiceBuilder::new()
                 // Handle errors from middleware

@@ -8,6 +8,8 @@ mod error;
 pub mod handlers;
 pub mod headers;
 pub mod metrics;
+pub mod request;
 pub mod response;
 mod rpc;
 pub mod templates;
+pub mod writeable;

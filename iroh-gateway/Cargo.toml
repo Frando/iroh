@@ -14,7 +14,7 @@ iroh-rpc-types = { path = "../iroh-rpc-types", default-features = false }
 cid = "0.8.6"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util"] }
-axum = "0.5.15"
+axum = { version = "0.5.15", features = ["headers"] }
 clap = { version = "4.0.9", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.78"
@@ -41,7 +41,7 @@ iroh-car = { path = "../iroh-car" }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1.1.0"
 tower-layer = { version = "0.3" }
-tower-http = { version = "0.3", features = ["trace", "compression-full"] }
+tower-http = { version = "0.3", features = ["trace", "compression-full", "cors"] }
 http = "0.2"
 async-recursion = "1.0.0"
 handlebars = "4"
@@ -60,6 +60,8 @@ http-body = "0.4.5"
 mime_classifier = "0.0.1"
 mime = "0.3"
 phf = { version = "0.11", features = ["macros"] }
+jsonwebtoken = "8.1.1"
+par-stream = { version = "0.10.2", default-features = false, features = ["runtime-tokio"] }
 
 [dev-dependencies]
 axum-macros = "0.2.0" # use #[axum_macros::debug_handler] for better error messages on handlers

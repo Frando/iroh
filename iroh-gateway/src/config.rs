@@ -10,6 +10,9 @@ use iroh_rpc_client::Config as RpcClientConfig;
 use iroh_rpc_types::{gateway::GatewayServerAddr, Addr};
 use iroh_util::insert_into_config_map;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use crate::writeable::{auth::JwtConfig, WriteableConfig};
 
 /// CONFIG_FILE_NAME is the name of the optional config file located in the iroh home directory
 pub const CONFIG_FILE_NAME: &str = "gateway.config.toml";
@@ -37,6 +40,11 @@ pub struct Config {
     /// set of user provided headers to attach to all responses
     #[serde(with = "http_serde::header_map")]
     pub headers: HeaderMap,
+
+    /// flag to toggle writeable mode
+    pub writeable: bool,
+    /// JWT secret to limit access to the writeable part of the gateway
+    pub jwt_secret: Option<String>,
 }
 
 impl Config {
@@ -48,11 +56,21 @@ impl Config {
             rpc_client,
             metrics: MetricsConfig::default(),
             denylist: false,
+            writeable: false,
+            jwt_secret: None,
         }
     }
 
     pub fn set_default_headers(&mut self) {
         self.headers = default_headers();
+    }
+
+    pub fn set_jwt_secret(&mut self, secret: String) {
+        self.jwt_secret = Some(secret);
+    }
+
+    pub fn set_writeable(&mut self, writeable: bool) {
+        self.writeable = writeable;
     }
 
     /// Derive server addr for non memory addrs.
@@ -117,6 +135,8 @@ impl Default for Config {
             rpc_client,
             metrics: MetricsConfig::default(),
             denylist: false,
+            jwt_secret: None,
+            writeable: false,
         };
         t.set_default_headers();
         t
@@ -140,6 +160,8 @@ impl Source for Config {
         insert_into_config_map(&mut map, "rpc_client", rpc_client);
         let metrics = self.metrics.collect()?;
         insert_into_config_map(&mut map, "metrics", metrics);
+        insert_into_config_map(&mut map, "writeable", self.writeable);
+        insert_into_config_map(&mut map, "jwt_secret", self.jwt_secret.clone());
         Ok(map)
     }
 }
@@ -159,6 +181,25 @@ impl crate::handlers::StateConfig for Config {
 
     fn user_headers(&self) -> &HeaderMap<HeaderValue> {
         &self.headers
+    }
+
+    fn writeable_config(&self) -> WriteableConfig {
+        match (self.writeable, &self.jwt_secret) {
+            (false, _) => WriteableConfig::Disabled,
+            (true, None) => {
+                tracing::warn!("Gateway is running in writeable mode without protection. Set GATEWAY_JWT_SECRET or jwt_secret in the gateway config to enable authorization.");
+                WriteableConfig::Unprotected
+            }
+            (true, Some(jwt_secret)) => {
+                match JwtConfig::from_secret_hs256(jwt_secret) {
+                    Ok(jwt_config) => WriteableConfig::Jwt(Arc::new(jwt_config)),
+                    Err(_) => {
+                        tracing::warn!("Supplied GATEWAY_JWT_SECRET is invalid. Disabling auth and write support.");
+                        WriteableConfig::Disabled
+                    }
+                }
+            }
+        }
     }
 }
 

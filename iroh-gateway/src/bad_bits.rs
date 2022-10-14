@@ -192,6 +192,7 @@ mod tests {
             Arc::new(config),
             rpc_addr,
             Arc::new(Some(RwLock::new(bbits))),
+            content_loader.clone(),
             content_loader,
         )
         .await
