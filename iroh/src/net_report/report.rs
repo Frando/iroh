@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{trace, warn};
 
 #[cfg(not(wasm_browser))]
-use super::reportgen::QadProbeReport;
-use super::{probes::Probe, reportgen::HttpsProbeReport};
+use super::qad::QadProbeReport;
+use super::{https::HttpsProbeReport, probes::Probe};
 
 /// A net_report report.
 #[derive(Default, Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]

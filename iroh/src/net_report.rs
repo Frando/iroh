@@ -36,18 +36,59 @@ use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 #[cfg(not(wasm_browser))]
-use self::reportgen::QadProbeReport;
+use self::qad::QadProbeReport;
 
 mod actor;
+mod captive_portal;
 mod defaults;
+mod https;
 mod metrics;
 mod probes;
+mod qad;
 mod report;
-mod reportgen;
 
 mod options;
 
-pub(crate) use self::reportgen::IfStateDetails;
+/// Some details required from the interface state of the device.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IfStateDetails {
+    /// Do we have IPv4 capbilities
+    pub(crate) have_v4: bool,
+    /// Do we have IPv6 capbilities
+    pub(crate) have_v6: bool,
+}
+
+impl IfStateDetails {
+    #[cfg(test)]
+    pub(super) fn fake() -> Self {
+        IfStateDetails {
+            have_v4: true,
+            have_v6: true,
+        }
+    }
+}
+
+impl From<netwatch::netmon::State> for IfStateDetails {
+    fn from(value: netwatch::netmon::State) -> Self {
+        IfStateDetails {
+            have_v4: value.have_v4,
+            have_v6: value.have_v6,
+        }
+    }
+}
+
+/// Any state that depends on sockets being available in the current environment.
+///
+/// Factored out so it can be disabled easily in browsers.
+#[cfg(not(wasm_browser))]
+#[derive(Debug, Clone)]
+pub(super) struct SocketState {
+    /// QUIC client to do QUIC address Discovery
+    pub(super) quic_client: Option<QuicClient>,
+    /// The DNS resolver to use for probes that need to resolve DNS records.
+    pub(super) dns_resolver: DnsResolver,
+}
+
 #[cfg(not(wasm_browser))]
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta)]
@@ -55,7 +96,7 @@ pub(crate) use self::reportgen::IfStateDetails;
 enum QadProbeError {
     #[error("Failed to resolve relay address")]
     GetRelayAddr {
-        source: self::reportgen::GetRelayAddrError,
+        source: self::qad::GetRelayAddrError,
     },
     #[error("Missing host in relay URL")]
     MissingHost,
@@ -68,10 +109,8 @@ enum QadProbeError {
 use self::actor::{NetReportActor, ProbeRequestSlot};
 #[cfg(wasm_browser)]
 pub use self::probes::Probe;
-#[cfg(not(wasm_browser))]
-use self::reportgen::SocketState;
 pub use self::{metrics::Metrics, report::Report};
-pub(crate) use self::{options::Options, reportgen::QuicConfig};
+pub(crate) use self::{options::Options, qad::QuicConfig};
 
 // QAD connection types, used by the actor.
 
@@ -240,7 +279,7 @@ async fn run_probe_v4(
 ) -> n0_error::Result<(QadProbeReport, QadConn), QadProbeError> {
     use noq_proto::PathId;
 
-    let relay_addr = reportgen::get_relay_addr_ipv4(&dns_resolver, &relay)
+    let relay_addr = qad::get_relay_addr_ipv4(&dns_resolver, &relay)
         .await
         .map_err(|source| e!(QadProbeError::GetRelayAddr { source }))?;
 
@@ -307,7 +346,7 @@ async fn run_probe_v6(
 ) -> n0_error::Result<(QadProbeReport, QadConn), QadProbeError> {
     use noq_proto::PathId;
 
-    let relay_addr = reportgen::get_relay_addr_ipv6(&dns_resolver, &relay)
+    let relay_addr = qad::get_relay_addr_ipv6(&dns_resolver, &relay)
         .await
         .map_err(|source| e!(QadProbeError::GetRelayAddr { source }))?;
 
