@@ -30,21 +30,19 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
 #[cfg(not(wasm_browser))]
-use super::reportgen::QadProbeReport;
-#[cfg(not(wasm_browser))]
+use super::qad::{QadConn, QadConns, QadProbeError, QadProbeReport};
 use super::{
-    QadConn, QadConns, QadProbeError, defaults::timeouts::QAD_PROBE_TIMEOUT, reportgen::SocketState,
-};
-use super::{
-    Report,
+    IfStateDetails, Report,
     defaults::timeouts::{
         ABORT_TIMEOUT, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, PROBES_TIMEOUT, REPORT_TIMEOUT,
     },
+    https::{HttpsProbeReport, ProbesError},
     metrics::Metrics,
     probes::{Probe, ProbePlan},
     report::RelayLatencies,
-    reportgen::{HttpsProbeReport, ProbesError},
 };
+#[cfg(not(wasm_browser))]
+use super::{SocketState, defaults::timeouts::QAD_PROBE_TIMEOUT};
 
 const FULL_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -54,7 +52,7 @@ const FULL_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// between actor ticks merge into a single request. The `is_major` flag
 /// is sticky: once set, it stays set until the actor consumes the request.
 pub(super) struct PendingProbeRequest {
-    pub if_state: super::reportgen::IfStateDetails,
+    pub if_state: IfStateDetails,
     pub is_major: bool,
 }
 
@@ -89,7 +87,7 @@ impl ProbeRequestSlot {
     /// If a request is already pending, `is_major` is OR-ed in and
     /// `if_state` is overwritten with the latest value. If no request
     /// is pending, a new one is created.
-    pub(super) fn request(&self, if_state: super::reportgen::IfStateDetails, is_major: bool) {
+    pub(super) fn request(&self, if_state: IfStateDetails, is_major: bool) {
         let mut guard = self.slot.lock().expect("not poisoned");
         match guard.as_mut() {
             Some(pending) => {
@@ -111,16 +109,20 @@ impl ProbeRequestSlot {
 }
 
 /// Outcome of a single probe task in the actor's [`JoinSet`].
+///
+/// Each variant wraps the result type of its probe, allowing the actor
+/// to dispatch on the probe kind in a single match.
 enum ProbeResult {
-    /// Completed QAD IPv4 probe with connection for reuse.
+    /// Completed QAD IPv4 probe. On success, includes the connection for reuse.
     #[cfg(not(wasm_browser))]
     QadV4(Result<(QadProbeReport, QadConn), QadProbeError>),
-    /// Completed QAD IPv6 probe with connection for reuse.
+    /// Completed QAD IPv6 probe. On success, includes the connection for reuse.
     #[cfg(not(wasm_browser))]
     QadV6(Result<(QadProbeReport, QadConn), QadProbeError>),
-    /// Completed HTTPS latency probe.
+    /// Completed HTTPS latency measurement against a relay.
     Https(Result<HttpsProbeReport, ProbesError>),
-    /// Completed captive portal detection check.
+    /// Completed captive portal detection. `None` means the check was
+    /// cancelled or timed out before producing a result.
     #[cfg(not(wasm_browser))]
     CaptivePortal(Option<bool>),
 }
@@ -155,24 +157,29 @@ impl Default for Reports {
 /// See the [module documentation](self) for an overview of the probe
 /// lifecycle and timeout strategy.
 pub(super) struct NetReportActor {
-    // -- probe tasks --
+    /// Running probe tasks. The actor drains these via `join_next`.
     probes: JoinSet<Option<ProbeResult>>,
 
-    // -- QAD connection state --
+    /// Winning QAD connections, reused across probe cycles.
     #[cfg(not(wasm_browser))]
     qad_conns: QadConns,
 
-    // -- configuration --
+    /// The set of relay servers to probe.
     relay_map: RelayMap,
+    /// Socket-dependent state (QUIC client, DNS resolver).
     #[cfg(not(wasm_browser))]
     socket_state: SocketState,
+    /// TLS client configuration for HTTPS and captive portal probes.
     #[cfg(not(wasm_browser))]
     tls_config: rustls::ClientConfig,
+    /// Which probe protocols are enabled for this run.
     protocols: BTreeSet<Probe>,
 
-    // -- report state --
+    /// The report being assembled during the current probe cycle.
     current_report: Report,
+    /// Historical reports used for preferred relay selection.
     reports: Reports,
+    /// Sink for publishing report updates to consumers.
     report_out: Watchable<Option<Report>>,
 
     /// When the current probe cycle started, or `None` if idle.
@@ -190,18 +197,23 @@ pub(super) struct NetReportActor {
     /// when no cycle is active or after it has already fired.
     abort_deadline: Option<Instant>,
 
-    // -- probe cancellation --
+    /// Cancels all outstanding IPv4 QAD probes once one succeeds.
     #[cfg(not(wasm_browser))]
     cancel_qad_v4: CancellationToken,
+    /// Cancels all outstanding IPv6 QAD probes once one succeeds.
     #[cfg(not(wasm_browser))]
     cancel_qad_v6: CancellationToken,
+    /// Cancels all outstanding HTTPS probes when coverage is complete or the abort deadline fires.
     cancel_https: CancellationToken,
+    /// Cancels the captive portal check when a QAD probe confirms UDP works.
     #[cfg(not(wasm_browser))]
     captive_portal_cancel: CancellationToken,
 
-    // -- input / lifecycle --
+    /// Shared slot through which the [`Client`](super::Client) submits probe requests.
     probe_requests: Arc<ProbeRequestSlot>,
+    /// Token that signals the actor to shut down.
     shutdown: CancellationToken,
+    /// Counters for probe cycles and outcomes.
     metrics: Arc<Metrics>,
 }
 
@@ -529,7 +541,7 @@ impl NetReportActor {
     /// Spawns QAD probes for IPv4 and IPv6 if needed. Reuses existing
     /// connections when available, and validates that they are still alive.
     #[cfg(not(wasm_browser))]
-    fn spawn_qad_probes(&mut self, if_state: &super::reportgen::IfStateDetails) {
+    fn spawn_qad_probes(&mut self, if_state: &IfStateDetails) {
         use tracing::{Instrument, warn_span};
 
         let Some(ref quic_client) = self.socket_state.quic_client else {
@@ -584,7 +596,12 @@ impl NetReportActor {
                         .run_until_cancelled_owned(async move {
                             match time::timeout(
                                 QAD_PROBE_TIMEOUT,
-                                super::run_probe_v4(relay, quic_client, dns_resolver, inner_token),
+                                super::qad::run_probe_v4(
+                                    relay,
+                                    quic_client,
+                                    dns_resolver,
+                                    inner_token,
+                                ),
                             )
                             .await
                             {
@@ -612,7 +629,12 @@ impl NetReportActor {
                         .run_until_cancelled_owned(async move {
                             match time::timeout(
                                 QAD_PROBE_TIMEOUT,
-                                super::run_probe_v6(relay, quic_client, dns_resolver, inner_token),
+                                super::qad::run_probe_v6(
+                                    relay,
+                                    quic_client,
+                                    dns_resolver,
+                                    inner_token,
+                                ),
                             )
                             .await
                             {
@@ -656,7 +678,7 @@ impl NetReportActor {
                             if !delay.is_zero() {
                                 time::sleep(delay).await;
                             }
-                            super::reportgen::run_https_probe(
+                            super::https::run_https_probe(
                                 #[cfg(not(wasm_browser))]
                                 &socket_state.dns_resolver,
                                 relay.url.clone(),
@@ -702,7 +724,7 @@ impl NetReportActor {
             }
             let result = time::timeout(
                 CAPTIVE_PORTAL_TIMEOUT,
-                super::reportgen::check_captive_portal(&dns, &relay_map, preferred, tls),
+                super::captive_portal::check_captive_portal(&dns, &relay_map, preferred, tls),
             )
             .await;
             Some(match result {
