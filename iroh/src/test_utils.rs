@@ -80,6 +80,7 @@ pub async fn run_relay_server_with(quic: bool) -> Result<(RelayMap, RelayUrl, Se
     let n: RelayMap = RelayConfig {
         url: url.clone(),
         quic,
+        h3: true,
     }
     .into();
     Ok((n, url, server))

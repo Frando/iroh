@@ -50,6 +50,7 @@ pub mod prod {
         RelayConfig {
             url: url.into(),
             quic: Some(RelayQuicConfig::default()),
+            h3: true,
         }
     }
 
@@ -62,6 +63,7 @@ pub mod prod {
         RelayConfig {
             url: url.into(),
             quic: Some(RelayQuicConfig::default()),
+            h3: true,
         }
     }
 
@@ -74,6 +76,7 @@ pub mod prod {
         RelayConfig {
             url: url.into(),
             quic: Some(RelayQuicConfig::default()),
+            h3: true,
         }
     }
 
@@ -86,6 +89,7 @@ pub mod prod {
         RelayConfig {
             url: url.into(),
             quic: Some(RelayQuicConfig::default()),
+            h3: true,
         }
     }
 }
@@ -119,6 +123,7 @@ pub mod staging {
         RelayConfig {
             url: url.into(),
             quic: Some(RelayQuicConfig::default()),
+            h3: true,
         }
     }
 
@@ -131,6 +136,7 @@ pub mod staging {
         RelayConfig {
             url: url.into(),
             quic: Some(RelayQuicConfig::default()),
+            h3: true,
         }
     }
 }

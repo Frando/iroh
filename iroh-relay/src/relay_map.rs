@@ -223,6 +223,12 @@ pub struct RelayConfig {
     /// with this relay server.
     #[serde(default = "quic_config")]
     pub quic: Option<RelayQuicConfig>,
+    /// Whether this relay supports WebTransport (H3) connections.
+    ///
+    /// When true and UDP is available, the client prefers WebTransport over
+    /// WebSocket for lower connection latency. Defaults to true.
+    #[serde(default = "h3_default")]
+    pub h3: bool,
 }
 
 impl From<RelayUrl> for RelayConfig {
@@ -230,12 +236,17 @@ impl From<RelayUrl> for RelayConfig {
         Self {
             url: value,
             quic: quic_config(),
+            h3: h3_default(),
         }
     }
 }
 
 fn quic_config() -> Option<RelayQuicConfig> {
     Some(RelayQuicConfig::default())
+}
+
+fn h3_default() -> bool {
+    true
 }
 
 /// Configuration for speaking to the QUIC endpoint on the relay
