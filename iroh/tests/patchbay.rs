@@ -36,7 +36,7 @@ use patchbay::{IfaceConfig, LinkCondition, LinkDirection, Nat};
 use testdir::testdir;
 use tracing::info;
 
-use self::util::{Pair, PathWatcherExt, lab_with_relay, ping_accept, ping_open};
+use self::util::{Pair, PathConnectionExt, lab_with_relay, ping_accept, ping_open};
 
 // Because we're in an integration test, we can't declare modules under patchbay/
 // without setting an explicit path.
@@ -77,10 +77,10 @@ async fn holepunch_simple() -> Result {
             Ok(())
         })
         .client(client, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("holepunch to direct")?;
             info!("connection became direct");
@@ -120,13 +120,13 @@ async fn run_add_faster_link(active_side: Side) -> Result {
     let timeout = Duration::from_secs(15);
     Pair::new(relay_map)
         .left(active_side, active, async move |dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            let first = paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            let first = conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("did not become direct")?;
-            info!(addr=?first.remote_addr(), "connection became direct");
+            info!(addr=?first, "connection became direct");
             ping_accept(&conn, timeout)
                 .await
                 .context("ping_accept before switch")?;
@@ -134,13 +134,13 @@ async fn run_add_faster_link(active_side: Side) -> Result {
             info!("bring up faster link (eth1)");
             dev.iface("eth1").unwrap().link_up().await?;
 
-            let next = paths
-                .wait_selected(timeout, |p| {
-                    p.is_ip() && p.remote_addr() != first.remote_addr()
+            let next = conn
+                .wait_selected_timeout(timeout, |p| {
+                    p.is_ip() && p.remote_addr() != &first
                 })
                 .await
                 .context("did not switch paths")?;
-            info!(addr=?next.remote_addr(), "new direct path established");
+            info!(addr=?next, "new direct path established");
             ping_accept(&conn, timeout)
                 .await
                 .context("ping_accept after switch")?;
@@ -149,24 +149,24 @@ async fn run_add_faster_link(active_side: Side) -> Result {
             Ok(())
         })
         .right(passive, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            let first = paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            let first = conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("did not become direct")?;
-            info!(addr=?first.remote_addr(), "connection became direct");
+            info!(addr=?first, "connection became direct");
             ping_open(&conn, timeout)
                 .await
                 .context("ping_open before switch")?;
 
-            let next = paths
-                .wait_selected(timeout, |p| {
-                    p.is_ip() && p.remote_addr() != first.remote_addr()
+            let next = conn
+                .wait_selected_timeout(timeout, |p| {
+                    p.is_ip() && p.remote_addr() != &first
                 })
                 .await
                 .context("did not switch paths")?;
-            info!(addr=?next.remote_addr(), "new direct path established");
+            info!(addr=?next, "new direct path established");
             ping_open(&conn, timeout)
                 .await
                 .context("ping_open after switch")?;
@@ -205,8 +205,8 @@ async fn run_link_outage_recovery(outage_side: Side, downtime: Duration) -> Resu
     let timeout = Duration::from_secs(15);
     Pair::new(relay_map)
         .left(outage_side, outage, async move |dev, _ep, conn| {
-            let mut paths = conn.paths();
-            paths.wait_ip(timeout).await.context("initial holepunch")?;
+            
+            conn.wait_ip_timeout(timeout).await.context("initial holepunch")?;
             info!("holepunched, now killing link for {downtime:?}");
             dev.iface("eth0").unwrap().link_down().await?;
             tokio::time::sleep(downtime).await;
@@ -218,8 +218,8 @@ async fn run_link_outage_recovery(outage_side: Side, downtime: Duration) -> Resu
                 .context("ping_open after link_up")?;
             info!("connection recovered after link outage");
 
-            paths
-                .wait_ip(timeout)
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("did not re-establish direct path")?;
             ping_open(&conn, timeout)
@@ -278,8 +278,8 @@ async fn run_hard_nat_to_holepunchable(replug_side: Side) -> Result {
     let timeout = Duration::from_secs(15);
     Pair::new(relay_map)
         .left(replug_side, replug, async move |dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
 
             ping_accept(&conn, timeout)
                 .await
@@ -287,15 +287,15 @@ async fn run_hard_nat_to_holepunchable(replug_side: Side) -> Result {
 
             tokio::time::sleep(Duration::from_secs(3)).await;
             assert!(
-                paths.selected().is_relay(),
+                conn.paths().selected().expect("no selected path").is_relay(),
                 "should still be relayed behind symmetric NAT"
             );
 
             info!("replug to holepunchable NAT");
             dev.iface("eth0").unwrap().replug(nat_easy.id()).await?;
 
-            paths
-                .wait_ip(timeout)
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("did not become direct after replug")?;
             info!("connection became direct");
@@ -307,11 +307,11 @@ async fn run_hard_nat_to_holepunchable(replug_side: Side) -> Result {
             Ok(())
         })
         .right(stable, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
             ping_open(&conn, timeout).await.context("ping 1 (relay)")?;
-            paths
-                .wait_ip(timeout)
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("did not become direct after replug")?;
             info!("connection became direct");
@@ -356,10 +356,10 @@ async fn run_holepunch_many_addrs(many_addrs_side: Side, addr_count: u8) -> Resu
     let timeout = Duration::from_secs(15);
     Pair::new(relay_map)
         .left(many_addrs_side, many_addrs, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("holepunch to direct with many addrs")?;
             info!("connection became direct");
@@ -368,10 +368,10 @@ async fn run_holepunch_many_addrs(many_addrs_side: Side, addr_count: u8) -> Resu
             Ok(())
         })
         .right(plain, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("holepunch to direct with many addrs")?;
             info!("connection became direct");

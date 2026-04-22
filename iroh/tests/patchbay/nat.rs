@@ -19,7 +19,7 @@ use patchbay::{Nat, NatConfig, NatFiltering, NatMapping};
 use testdir::testdir;
 use tracing::info;
 
-use super::util::{Pair, PathWatcherExt, lab_with_relay};
+use super::util::{Pair, PathConnectionExt, lab_with_relay};
 use crate::util::{ping_accept, ping_open};
 
 enum NatKind {
@@ -103,10 +103,10 @@ async fn run_nat_holepunch(nat_server: NatKind, nat_client: NatKind) -> Result {
     let timeout = Duration::from_secs(15);
     Pair::new(relay_map)
         .server(server, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("holepunch to direct")?;
             info!("connection became direct");
@@ -115,10 +115,10 @@ async fn run_nat_holepunch(nat_server: NatKind, nat_client: NatKind) -> Result {
             Ok(())
         })
         .client(client, async move |_dev, _ep, conn| {
-            let mut paths = conn.paths();
-            assert!(paths.selected().is_relay(), "connection started relayed");
-            paths
-                .wait_ip(timeout)
+            
+            assert!(conn.paths().selected().expect("no selected path").is_relay(), "connection started relayed");
+            conn
+                .wait_ip_timeout(timeout)
                 .await
                 .context("holepunch to direct")?;
             info!("connection became direct");

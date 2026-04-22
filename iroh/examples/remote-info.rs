@@ -98,13 +98,12 @@ fn log_active(remote_map: &RemoteMap) {
     println!("current remote state:");
     for (id, info) in remote_map.read().iter() {
         println!(
-            "[{}] is_active {}, connections {}, ip_path {:?}, relay_path {:?}, current_min_rtt {:?}",
+            "[{}] is_active {}, connections {}, ip_path {:?}, relay_path {:?}",
             id.fmt_short(),
             info.is_active(),
             info.connections().count(),
             info.has_ip_path(),
             info.has_relay_path(),
-            info.current_min_rtt()
         );
     }
 }
@@ -126,7 +125,7 @@ fn log_aggregate(remote_map: &RemoteMap) {
             aggregate.relay_path,
             SystemTime::now()
                 .duration_since(aggregate.last_update)
-                .unwrap()
+                .unwrap_or_default()
         );
     }
 }
@@ -166,12 +165,11 @@ mod remote_map {
     };
 
     use iroh::{
-        EndpointId, Watcher,
-        endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks, PathInfo},
+        EndpointId, TransportAddr,
+        endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks, PathEvent},
     };
-    use n0_future::task::AbortOnDropHandle;
+    use n0_future::{StreamExt, task::AbortOnDropHandle};
     use tokio::{sync::mpsc, task::JoinSet};
-    use tokio_stream::StreamExt;
     use tracing::{Instrument, debug, info, info_span};
 
     /// Information about a remote info.
@@ -209,19 +207,20 @@ mod remote_map {
     }
 
     impl Aggregate {
-        fn update(&mut self, path: &PathInfo) {
-            self.last_update = SystemTime::now();
-            if path.is_ip() {
+        fn observe_open(&mut self, addr: &TransportAddr) {
+            if addr.is_ip() {
                 self.ip_path = true;
             }
-            if path.is_relay() {
+            if addr.is_relay() {
                 self.relay_path = true;
             }
-            if let Some(stats) = path.stats() {
-                debug!("path update addr {:?} {stats:?}", path.remote_addr());
-                self.rtt_min = self.rtt_min.min(stats.rtt);
-                self.rtt_max = self.rtt_max.max(stats.rtt);
-            }
+            self.last_update = SystemTime::now();
+        }
+
+        fn observe_rtt(&mut self, rtt: Duration) {
+            self.rtt_min = self.rtt_min.min(rtt);
+            self.rtt_max = self.rtt_max.max(rtt);
+            self.last_update = SystemTime::now();
         }
     }
 
@@ -233,37 +232,20 @@ mod remote_map {
             &self.aggregate
         }
 
-        /// Returns the minimal RTT of all currently active paths.
-        ///
-        /// Returns `None` if there are no active connections.
-        pub fn current_min_rtt(&self) -> Option<Duration> {
-            self.connections()
-                .flat_map(|c| c.paths().get().into_iter())
-                .flat_map(|p| p.stats())
-                .map(|s| s.rtt)
-                .min()
-        }
-
-        /// Returns whether any active connection to the remote has an active IP path.
+        /// Returns whether this remote ever had an IP path, across all
+        /// connections past and present.
         ///
         /// Returns `None` if there are no active connections.
         pub fn has_ip_path(&self) -> Option<bool> {
-            self.connections()
-                .flat_map(|c| c.paths().get())
-                .filter(|path| path.is_ip())
-                .map(|_| true)
-                .next()
+            self.is_active().then_some(self.aggregate.ip_path)
         }
 
-        /// Returns whether any active connection to the remote has an active relay path.
+        /// Returns whether this remote ever had a relay path, across all
+        /// connections past and present.
         ///
         /// Returns `None` if there are no active connections.
         pub fn has_relay_path(&self) -> Option<bool> {
-            self.connections()
-                .flat_map(|c| c.paths().get())
-                .filter(|path| path.is_relay())
-                .map(|_| true)
-                .next()
+            self.is_active().then_some(self.aggregate.relay_path)
         }
 
         /// Returns `true` if there are active connections to this node.
@@ -393,12 +375,10 @@ mod remote_map {
                 let map = map.clone();
                 async move {
                     conn.closed().await;
-                    {
-                        let mut inner = map.write().expect("poisoned");
-                        let info = inner.entry(conn.remote_id()).or_default();
-                        info.connections.remove(&conn_id);
-                        info.aggregate.last_update = SystemTime::now();
-                    }
+                    let mut inner = map.write().expect("poisoned");
+                    let info = inner.entry(conn.remote_id()).or_default();
+                    info.connections.remove(&conn_id);
+                    info.aggregate.last_update = SystemTime::now();
                 }
                 .instrument(tracing::Span::current())
             });
@@ -406,14 +386,22 @@ mod remote_map {
             // Track path changes to update stats aggregate.
             tasks.spawn({
                 async move {
-                    let mut path_updates = conn.paths().stream();
-                    while let Some(paths) = path_updates.next().await {
-                        {
-                            let mut inner = map.write().expect("poisoned");
-                            let info = inner.entry(conn.remote_id()).or_default();
-                            for path in paths {
-                                info.aggregate.update(&path);
+                    let mut events = conn.path_events();
+                    while let Some(event) = events.next().await {
+                        let mut inner = map.write().expect("poisoned");
+                        let info = inner.entry(conn.remote_id()).or_default();
+                        match event {
+                            PathEvent::Opened { id, remote_addr } => {
+                                debug!(%id, ?remote_addr, "path opened");
+                                info.aggregate.observe_open(&remote_addr);
                             }
+                            PathEvent::Closed {
+                                id, last_stats, ..
+                            } => {
+                                debug!(%id, rtt=?last_stats.rtt, "path closed");
+                                info.aggregate.observe_rtt(last_stats.rtt);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -432,8 +420,10 @@ mod remote_map {
                 let mut inner = map.write().expect("poisoned");
                 inner.retain(|_remote, info| {
                     info.is_active()
-                        || now.duration_since(info.aggregate().last_update).unwrap()
-                            < retention_time
+                        || now
+                            .duration_since(info.aggregate().last_update)
+                            .map(|age| age < retention_time)
+                            .unwrap_or(true)
                 });
             }
         }

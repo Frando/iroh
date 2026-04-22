@@ -40,7 +40,6 @@ use indicatif::HumanBytes;
 use ipnet::{Ipv4Net, Ipv6Net};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    Watcher,
     address_lookup::{
         AddrFilter,
         dns::DnsAddressLookup,
@@ -48,12 +47,13 @@ use iroh::{
     },
     dns::{DnsResolver, N0_DNS_ENDPOINT_ORIGIN_PROD, N0_DNS_ENDPOINT_ORIGIN_STAGING},
     endpoint::{
-        BindOpts, Connection, ConnectionError, PathId, PathWatcher, QuicTransportConfig,
-        RecvStream, SendStream, VarInt, WriteError, presets,
+        BindOpts, Connection, ConnectionError, PathEvent, PathId, QuicTransportConfig, RecvStream,
+        SendStream, VarInt, WriteError, presets,
     },
 };
 use n0_error::{Result, StackResultExt, StdResultExt, anyerr, ensure_any};
-use n0_future::{stream::StreamExt, task::AbortOnDropHandle};
+use n0_future::StreamExt;
+use n0_future::task::AbortOnDropHandle;
 use postcard::experimental::max_size::MaxSize;
 use serde::{Deserialize, Serialize, Serializer};
 use tokio::{
@@ -644,7 +644,9 @@ async fn provide(endpoint: &Endpoint, output: Output) -> Result<()> {
 async fn handle_connection(conn: Connection, output: Output) {
     let start = Instant::now();
     let remote_id = conn.remote_id();
-    let watcher = conn.paths();
+    // Spawn a stats collector early, so we capture final stats for every
+    // path that closes during this connection's lifetime.
+    let stats_task = spawn_stats_collector(conn.clone());
     let _guard = watch_conn_type(&conn, Some(remote_id), output);
 
     // Accept incoming streams in a loop until the connection is closed by the remote.
@@ -677,7 +679,9 @@ async fn handle_connection(conn: Connection, output: Output) {
             duration: start.elapsed(),
         },
     );
-    output.emit_with_remote(remote_id, PathStats::from_watcher(watcher));
+    drop(conn);
+    let stats = stats_task.await.unwrap_or_default();
+    output.emit_with_remote(remote_id, PathStats { paths: stats });
 }
 
 #[instrument("handle", skip_all, fields(id=send.id().index()))]
@@ -720,7 +724,7 @@ async fn fetch(
         remote_id,
         duration: start.elapsed(),
     });
-    let watcher = conn.paths();
+    let stats_task = spawn_stats_collector(conn.clone());
     // Spawn a background task that prints connection type changes. Will be aborted on drop.
     let _guard = watch_conn_type(&conn, None, output);
 
@@ -767,11 +771,12 @@ async fn fetch(
         duration: start.elapsed(),
     });
 
-    // Stats are collected by the paths watcher, so we do not look at the stats returned by
-    // this call. It is however the only API we currently have to tell us when the
-    // connection is drained and the stats will no longer change.
+    // Wait for the connection to fully drain, then drop the last strong
+    // ref so the event stream inside the stats collector ends.
     conn_info.closed().await;
-    output.emit(PathStats::from_watcher(watcher));
+    drop(conn);
+    let stats = stats_task.await.unwrap_or_default();
+    output.emit(PathStats { paths: stats });
 
     res
 }
@@ -942,24 +947,17 @@ fn watch_conn_type(
             output.emit(event)
         }
     };
-    let mut stream = conn.paths().stream();
+    let mut events = conn.path_events();
+    let conn = conn.clone();
     let task = tokio::task::spawn(async move {
-        let mut previous = None;
-        while let Some(paths) = stream.next().await {
-            if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-                // We can get path updates without the selected path changing. We don't want to log again in that case.
-                if Some(path) == previous.as_ref() {
-                    continue;
-                }
+        while let Some(event) = events.next().await {
+            if let PathEvent::Selected { id, remote_addr } = event {
+                let rtt = conn.paths().get(id).map(|p| p.rtt()).unwrap_or_default();
                 print(SelectedPath::Selected {
-                    id: path.id(),
-                    addr: path.remote_addr().clone(),
-                    rtt: path.rtt().expect("conn is not dropped"),
+                    id,
+                    addr: remote_addr,
+                    rtt,
                 });
-                previous = Some(path.clone());
-            } else {
-                output.emit(SelectedPath::None);
-                previous = None;
             }
         }
     });
@@ -1089,6 +1087,7 @@ struct ConnectionTypeChanged {
 
 #[derive(Serialize, Debug, Clone)]
 #[serde(tag = "status")]
+#[allow(dead_code)]
 enum SelectedPath {
     Selected {
         #[serde(skip)]
@@ -1165,24 +1164,31 @@ struct PathStats {
     paths: Vec<PathData>,
 }
 
-impl PathStats {
-    fn from_watcher(mut watcher: PathWatcher) -> Self {
-        let list = watcher
-            .get()
-            .iter()
-            .filter_map(|info| {
-                let stats = info.stats()?;
-                Some(PathData {
-                    id: info.id(),
-                    remote_addr: info.remote_addr().clone(),
-                    rtt: stats.rtt,
-                    bytes_sent: stats.udp_tx.bytes,
-                    bytes_recv: stats.udp_rx.bytes,
-                })
-            })
-            .collect();
-        PathStats { paths: list }
-    }
+/// Spawn a task that accumulates final per-path stats by listening to the
+/// connection's path events. The task subscribes at call time (so no events
+/// are missed) and finishes when the event stream ends (connection closed).
+fn spawn_stats_collector(conn: Connection) -> tokio::task::JoinHandle<Vec<PathData>> {
+    let mut events = conn.path_events();
+    tokio::spawn(async move {
+        let mut stats: Vec<PathData> = Vec::new();
+        while let Some(event) = events.next().await {
+            if let PathEvent::Closed {
+                id,
+                remote_addr,
+                last_stats,
+            } = event
+            {
+                stats.push(PathData {
+                    id,
+                    remote_addr,
+                    rtt: last_stats.rtt,
+                    bytes_sent: last_stats.udp_tx.bytes,
+                    bytes_recv: last_stats.udp_rx.bytes,
+                });
+            }
+        }
+        stats
+    })
 }
 
 impl fmt::Display for PathStats {

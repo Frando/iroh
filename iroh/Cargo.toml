@@ -21,6 +21,7 @@ crate-type = ["lib", "cdylib"]
 workspace = true
 
 [dependencies]
+arc-swap = "1.7"
 backon = { version = "1.4" }
 blake3 = { version = "1.8.3", default-features = false }
 bytes = "1.11"

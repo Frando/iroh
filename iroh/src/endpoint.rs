@@ -37,8 +37,8 @@ use self::hooks::EndpointHooksList;
 pub use super::socket::{
     BindError, DirectAddr, DirectAddrType,
     remote_map::{
-        PathInfo, PathInfoList, PathInfoListIter, PathWatcher, RemoteInfo, Source,
-        TransportAddrInfo, TransportAddrUsage,
+        Path, PathEvent, PathEventStream, Paths, RemoteInfo, Source, TransportAddrInfo,
+        TransportAddrUsage,
     },
 };
 #[cfg(wasm_browser)]
@@ -1959,7 +1959,7 @@ mod tests {
         address_lookup::memory::MemoryLookup,
         endpoint::{
             ApplicationClose, BindError, BindOpts, ConnectError, ConnectOptions,
-            ConnectWithOptsError, Connection, ConnectionError, PathWatcher, presets,
+            ConnectWithOptsError, Connection, ConnectionError, PathEvent, presets,
         },
         protocol::{AcceptError, ProtocolHandler, Router},
         test_utils::{QlogFileGroup, run_relay_server, run_relay_server_with},
@@ -2359,13 +2359,15 @@ mod tests {
             let conn = ep.connect(dst, TEST_ALPN).await?;
             let mut send = conn.open_uni().await.anyerr()?;
             send.write_all(b"hello").await.anyerr()?;
-            let mut paths = conn.paths().stream();
+            let mut events = conn.path_events();
             info!("Waiting for direct connection");
-            while let Some(infos) = paths.next().await {
-                info!(?infos, "new PathInfos");
-                if infos.iter().any(|info| info.is_ip()) {
+            loop {
+                if conn.paths().iter().any(|p| p.is_ip()) {
                     break;
                 }
+                let Some(_ev) = events.next().await else {
+                    panic!("path event stream ended before direct path");
+                };
             }
             info!("Have direct connection");
             #[cfg(feature = "metrics")]
@@ -2464,18 +2466,24 @@ mod tests {
             let conn = ep.connect(dst, TEST_ALPN).await?;
             let mut send = conn.open_uni().await.anyerr()?;
             send.write_all(b"hello").await.anyerr()?;
-            let mut paths = conn.paths().stream();
+            let mut events = conn.path_events();
             info!("Waiting for connection");
-            'outer: while let Some(infos) = paths.next().await {
-                info!(?infos, "new PathInfos");
-                for info in infos.iter() {
-                    if info.is_ip() {
-                        panic!("should not happen: {:?}", info);
-                    }
-                    if info.is_relay() {
-                        break 'outer;
+            loop {
+                let paths = conn.paths();
+                let mut found_relay = false;
+                for p in paths.iter() {
+                    assert!(!p.is_ip(), "should not happen: {:?}", p);
+                    if p.is_relay() {
+                        found_relay = true;
                     }
                 }
+                drop(paths);
+                if found_relay {
+                    break;
+                }
+                let Some(_) = events.next().await else {
+                    panic!("path event stream ended before relay path");
+                };
             }
             info!("Have relay connection");
             send.write_all(b"close please").await.anyerr()?;
@@ -2564,22 +2572,22 @@ mod tests {
 
             // We should be connected via IP, because it is faster than the relay server.
             // TODO: Maybe not panic if this is not true?
-            let path_info = conn.paths().get();
-            assert_eq!(path_info.len(), 1);
-            assert!(path_info.iter().next().unwrap().is_ip());
+            let paths = conn.paths();
+            assert_eq!(paths.len(), 1);
+            assert!(paths.iter().next().unwrap().is_ip());
+            drop(paths);
 
-            let mut paths = conn.paths().stream();
-            time::timeout(Duration::from_secs(5), async move {
-                while let Some(infos) = paths.next().await {
-                    info!(?infos, "new PathInfos");
-                    if infos.iter().any(|info| info.is_relay()) {
-                        info!("client has a relay path");
-                        break;
+            let mut events = conn.path_events();
+            time::timeout(Duration::from_secs(5), async {
+                while !conn.paths().iter().any(|p| p.is_relay()) {
+                    if events.next().await.is_none() {
+                        panic!("path event stream ended before relay path");
                     }
                 }
             })
             .await
             .anyerr()?;
+            info!("client has a relay path");
 
             // wait for the server to signal it has the relay connection
             let mut stream = conn.accept_uni().await.anyerr()?;
@@ -2615,18 +2623,17 @@ mod tests {
             // Wait for a relay connection to be added.  Client does all the asserting here,
             // we just want to wait so we get to see all the mechanics of the connection
             // being added on this side too.
-            let mut paths = conn.paths().stream();
-            time::timeout(Duration::from_secs(5), async move {
-                while let Some(infos) = paths.next().await {
-                    info!(?infos, "new PathInfos");
-                    if infos.iter().any(|path| path.is_relay()) {
-                        info!("server has a relay path");
-                        break;
+            let mut events = conn.path_events();
+            time::timeout(Duration::from_secs(5), async {
+                while !conn.paths().iter().any(|p| p.is_relay()) {
+                    if events.next().await.is_none() {
+                        panic!("path event stream ended before relay path");
                     }
                 }
             })
             .await
             .anyerr()?;
+            info!("server has a relay path");
 
             let mut stream = conn.open_uni().await.anyerr()?;
             stream.write_all(b"have relay").await.anyerr()?;
@@ -3481,17 +3488,30 @@ mod tests {
         ));
         let transfer_size = 1_000_000;
 
-        fn collect_stats(mut watcher: PathWatcher) -> BTreeMap<TransportAddr, PathStats> {
-            watcher
-                .get()
-                .iter()
-                .map(|info| {
-                    (
-                        info.remote_addr().clone(),
-                        info.stats().expect("conn is not yet dropped"),
-                    )
-                })
-                .collect()
+        /// Background task: accumulates final per-path stats by matching
+        /// Closed events from a stream taken early, then returns the map.
+        /// Called once per side (client + server). The connection ref is
+        /// moved in; it'll be dropped when this task exits, after which
+        /// the event stream ends.
+        fn spawn_stats_collector(
+            conn: Connection,
+        ) -> tokio::task::JoinHandle<BTreeMap<TransportAddr, PathStats>> {
+            use n0_future::StreamExt;
+            let mut events = conn.path_events();
+            tokio::spawn(async move {
+                let mut stats: BTreeMap<TransportAddr, PathStats> = BTreeMap::new();
+                while let Some(ev) = events.next().await {
+                    if let PathEvent::Closed {
+                        remote_addr,
+                        last_stats,
+                        ..
+                    } = ev
+                    {
+                        stats.insert(remote_addr, *last_stats);
+                    }
+                }
+                stats
+            })
         }
 
         let client = Endpoint::builder(presets::Minimal)
@@ -3511,25 +3531,27 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let incoming = server.accept().await.anyerr()?;
             let conn = incoming.await.anyerr()?;
-            let watcher = conn.paths();
+            let stats_task = spawn_stats_collector(conn.clone());
             let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
             let msg = recv.read_to_end(transfer_size).await.anyerr()?;
             send.write_all(&msg).await.anyerr()?;
             send.finish().anyerr()?;
             conn.closed().await;
-            let stats = collect_stats(watcher);
+            drop(conn);
+            let stats = stats_task.await.expect("stats task panicked");
             Ok::<_, Error>(stats)
         });
 
         let conn = client.connect(server_addr, TEST_ALPN).await?;
-        let watcher = conn.paths();
+        let client_stats_task = spawn_stats_collector(conn.clone());
         let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
         send.write_all(&vec![42u8; transfer_size]).await.anyerr()?;
         send.finish().anyerr()?;
         recv.read_to_end(transfer_size).await.anyerr()?;
         conn.close(0u32.into(), b"thanks, bye!");
+        drop(conn);
         client.close().await;
-        let client_stats = collect_stats(watcher);
+        let client_stats = client_stats_task.await.expect("client stats panicked");
         let server_stats = server_task.await.anyerr()??;
 
         info!("client stats: {client_stats:#?}");
